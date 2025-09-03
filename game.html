@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Flappy Square - One File Game (Easier)</title>
+  <style>
+    :root{ --bg:#0b0f1a; --fg:#e6edf3; --accent:#6ee7ff; --accent2:#ffb86b; }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:linear-gradient(180deg,#0b0f1a 0%,#121826 100%);color:var(--fg);font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .wrap{display:grid;place-items:center;height:100%;padding:16px}
+    canvas{background:radial-gradient(1000px 600px at 50% 30%, #0f172a 0%, #0b0f1a 60%, #070b13 100%);border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,.45);touch-action:manipulation}
+    .hud{position:fixed;inset:0;pointer-events:none;display:flex;align-items:center;justify-content:center}
+    .btn{pointer-events:auto;background:linear-gradient(180deg,#1f2937, #111827);color:#fff;border:1px solid #2b3443;border-radius:12px;padding:12px 18px;font-weight:700;letter-spacing:.2px;box-shadow:0 6px 24px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.05);cursor:pointer;transition:transform .08s ease,box-shadow .2s}
+    .btn:hover{transform:translateY(-1px)}
+    .panel{position:absolute;top:16px;left:50%;transform:translateX(-50%);display:flex;gap:10px;align-items:center;background:rgba(16,21,35,.65);border:1px solid rgba(255,255,255,.06);backdrop-filter: blur(6px);padding:8px 12px;border-radius:12px}
+    .stat{font-weight:700}
+    .muter{position:absolute;top:16px;right:16px}
+    .hint{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);font-size:12px;opacity:.65}
+    .overlay{position:absolute;inset:0;display:grid;place-items:center;background:rgba(5,8,12,.55);backdrop-filter: blur(3px)}
+    .title{font-size:28px;font-weight:900;letter-spacing:.5px;margin-bottom:10px}
+    .sub{opacity:.8;margin-bottom:14px}
+    .kbd{background:#1f2937;border:1px solid #2b3443;border-radius:6px;padding:2px 6px;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="420" height="720" aria-label="game canvas" role="img"></canvas>
+    <div class="hud">
+      <div class="panel" id="panel"><span>Score: <span class="stat" id="score">0</span></span><span> / Best: <span class="stat" id="best">0</span></span></div>
+      <button class="btn muter" id="muteBtn" aria-label="toggle sound">🔊</button>
+      <div class="hint">Tap / Click / <span class="kbd">Space</span> で上昇 ・ <span class="kbd">P</span> でポーズ（開始はボタン）</div> <!-- ★ 文言更新 -->
+    </div>
+    <div class="overlay" id="menu">
+      <div style="text-align:center">
+        <div class="title" id="menuTitle">Flappy Square</div>
+        <div class="sub" id="menuSub">一つのボタンだけ。シンプルでちょい優しめ。</div>
+        <button class="btn" id="startBtn">▶ スタート</button>
+        <div style="margin-top:12px;font-size:13px;opacity:.75">Space / クリック / タップ はプレイ中のみ上昇。障害物 + ビームを避けてスコアを伸ばそう。</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  ;(() => {
+    const W = 420, H = 720;
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    // ----- Utilities -----
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const rand = (a,b) => Math.random()*(b-a)+a;
+
+    // ----- Audio -----
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext || function(){})();
+    let muted = false;
+    const beep = (freq=440, dur=0.08, type='sine', vol=0.08) => {
+      if(muted || !audioCtx || audioCtx.state==='suspended') return;
+      const t = audioCtx.currentTime;
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t);
+      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(vol, t+0.005);
+      g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+      o.connect(g).connect(audioCtx.destination);
+      o.start(t); o.stop(t+dur+0.02);
+    };
+
+    // ----- Game Mode -----
+    const MODE = { MENU:'menu', PLAY:'play', PAUSE:'pause', OVER:'over' };
+
+    const state = {
+      mode: MODE.MENU,
+      score:0, best: +localStorage.getItem('flappy_best')||0,
+      t:0,
+      startGraceMs: 2000,
+      bird: { x: W*0.32, y: H*0.5, vx:0, vy:0, s:22, rot:0 },
+      pipes: [],
+      particles: [],
+      beams: [],                 // ★ ビーム
+      nextBeamAt: Infinity       // ★ 次のビーム生成時刻(ms)
+    };
+
+    // ----- Input -----
+    function flap(){
+      // ★ プレイ中のみ反応（勝手にスタート防止）
+      if(state.mode !== MODE.PLAY) return;
+      state.bird.vy = -5.8;
+      state.bird.rot = -0.5;
+      spawnThrust();
+      beep(660,0.07,'square',0.05);
+    }
+
+    function startGame(){        // ★ 開始専用関数
+      reset(false);
+      start();
+    }
+
+    function togglePause(){
+      if(state.mode===MODE.PLAY){ state.mode = MODE.PAUSE; beep(240,0.05,'sine',0.04);}
+      else if(state.mode===MODE.PAUSE){ state.mode = MODE.PLAY; beep(280,0.05,'sine',0.04);}
+    }
+
+    window.addEventListener('keydown', e=>{
+      if(e.code==='Space'){ e.preventDefault(); flap(); }        // ★ プレイ中のみ上で弾かれる
+      if(e.key==='p' || e.key==='P'){ togglePause(); }
+      if(e.key==='Enter' && (state.mode===MODE.MENU || state.mode===MODE.OVER)){ // ★ Enterで開始（任意）
+        startGame();
+      }
+    });
+    canvas.addEventListener('pointerdown', ()=>{ flap(); });      // ★ ここもプレイ中のみ反応
+    document.getElementById('startBtn').addEventListener('click', startGame); // ★ ボタンでのみ開始
+
+    // Mute button
+    const muteBtn = document.getElementById('muteBtn');
+    muteBtn.addEventListener('click', ()=>{
+      muted = !muted; muteBtn.textContent = muted ? '🔇' : '🔊';
+      if(audioCtx && audioCtx.state==='suspended') audioCtx.resume().catch(()=>{});
+    });
+
+    // ----- Pipes (easier) -----
+    const GAP_MIN = 190, GAP_MAX = 240;
+    const PIPE_W = 64;
+    const PIPE_SPACING = 380;   // ★ さらに広く
+    const SPEED_BASE = 1.85;
+
+    function spawnPipe(initialX){
+      const difficulty = Math.min(1, Math.floor(state.score/15)*0.04 + state.t/140000);
+      const gap = clamp(GAP_MAX - difficulty*30, GAP_MIN, GAP_MAX);
+      const margin = 80;
+      const gapY = rand(margin, H - margin - gap);
+      state.pipes.push({ x: initialX ?? W + PIPE_W, gapY, gap, passed:false });
+    }
+
+    function reset(showMenu=true){
+      state.score = 0; state.t = 0;
+      state.pipes.length=0; state.particles.length=0; state.beams.length=0; // ★ ビームもクリア
+      Object.assign(state.bird,{ x:W*0.32, y:H*0.5, vx:0, vy:0, s:22, rot:0 });
+      state.mode = showMenu ? MODE.MENU : MODE.PLAY;
+      state.nextBeamAt = state.startGraceMs + 1500;               // ★ グレース直後から
+      document.getElementById('score').textContent = '0';
+      // menu texts
+      document.getElementById('menuTitle').textContent = 'Flappy Square';
+      document.getElementById('menuSub').textContent = '一つのボタンだけ。シンプルでちょい優しめ。';
+      const btn = document.getElementById('startBtn');
+      btn.textContent = '▶ スタート';
+      document.getElementById('menu').style.display = showMenu ? 'grid' : 'none';
+    }
+
+    function start(){
+      state.mode = MODE.PLAY;
+      state.t = 0;
+      document.getElementById('menu').style.display='none';
+      if(state.pipes.length===0){
+        for(let i=1;i<=3;i++) spawnPipe(W + i*PIPE_SPACING + 120);
+      }
+    }
+
+    // ----- Particles -----
+    function spawnThrust(){
+      for(let i=0;i<6;i++){
+        state.particles.push({
+          x: state.bird.x - state.bird.s*0.6,
+          y: state.bird.y + state.bird.s*0.2 + rand(-3,3),
+          r: rand(1.5,3.5), vx: rand(-2.0,-0.6), vy: rand(-0.6,0.6), life: rand(220,360)
+        });
+      }
+    }
+
+    // ----- Collision Helper -----
+    function intersectsPipe(bx,by,br, px,py,pw,ph){
+      const cx = clamp(bx, px, px+pw);
+      const cy = clamp(by, py, py+ph);
+      const dx = bx - cx, dy = by - cy;
+      return (dx*dx + dy*dy) < br*br;
+    }
+
+    // ----- Resize -----
+    function fit(){
+      const scale = Math.min(window.innerWidth/(W+32), window.innerHeight/(H+32));
+      canvas.style.width = Math.floor(W*scale)+"px";
+      canvas.style.height = Math.floor(H*scale)+"px";
+    }
+    window.addEventListener('resize', fit); fit();
+
+    // ----- Beams (enemy shots) -----
+    // フロー: warn(点滅ライン) → fire(高速レーザー)
+    function spawnBeam(){
+      const y = Math.round(rand(80, H-80));
+      const warnMs = 700;
+      const speed = 6.4;    // 速すぎず避けられる程度
+      const h = 7;          // ビーム厚み
+      const w = 220;        // ビーム長さ
+      state.beams.push({ x: W+10, y, phase:'warn', timer: warnMs, speed, h, w });
+      beep(540,0.06,'sine',0.045); // 警告音
+    }
+
+    function updateBeams(dt, grace){
+      // 生成タイミング
+      if(state.t >= state.nextBeamAt && !grace && state.mode===MODE.PLAY){
+        spawnBeam();
+        const interval = rand(2600, 4500) - Math.min(1200, state.score*15); // スコアで少し短縮
+        state.nextBeamAt = state.t + Math.max(1600, interval);
+      }
+
+      // 進行＆当たり判定
+      for(let i=state.beams.length-1;i>=0;i--){
+        const b = state.beams[i];
+        if(b.phase==='warn'){
+          b.timer -= dt*16.666;
+          if(b.timer<=0){
+            b.phase='fire';
+            b.x = W + b.w + 6;       // 右端の少し外から
+            beep(920,0.05,'triangle',0.06); // 発射音
+          }
+        }else{ // fire
+          b.x -= b.speed * 3.6 * dt;
+          // 当たり判定（ビームは [x-w, x] × [y-h/2, y+h/2] の長方形）
+          if(!grace){
+            const bx = b.x - b.w, by = b.y - b.h/2, bw = b.w, bh = b.h;
+            const r = state.bird.s*0.62;
+            if(intersectsPipe(state.bird.x, state.bird.y, r, bx, by, bw, bh)){
+              return true; // hit
+            }
+          }
+          // 画面外へ
+          if(b.x < -b.w - 20) state.beams.splice(i,1);
+        }
+      }
+      return false;
+    }
+
+    // ----- Main Loop -----
+    let last=performance.now();
+    function loop(now){
+      requestAnimationFrame(loop);
+      const dt = clamp((now-last)/16.666, 0, 2);
+      last = now;
+      if(state.mode===MODE.PAUSE || state.mode===MODE.MENU || state.mode===MODE.OVER){ draw(); return; }
+      update(dt);
+      draw();
+    }
+    requestAnimationFrame(loop);
+
+    function update(dt){
+      state.t += dt*16.666;
+      const bird = state.bird;
+
+      // Gravity & motion
+      bird.vy += 0.2 * dt;
+      bird.y += bird.vy * 2.5 * dt;
+      bird.rot = clamp(bird.rot + 0.035*dt, -0.5, 0.75);
+      bird.y = clamp(bird.y, -20, H-38);
+
+      // Move pipes
+      const speed = SPEED_BASE + Math.min(1.2, state.score*0.012 + state.t/160000);
+      for(const p of state.pipes){ p.x -= speed * 3.0 * dt; }
+
+      // Spawn more pipes
+      if(state.pipes.length){
+        const lastP = state.pipes[state.pipes.length-1];
+        if(lastP.x < W - PIPE_SPACING){ spawnPipe(); }
+      }
+      // Remove off-screen pipes
+      while(state.pipes.length && state.pipes[0].x < -PIPE_W-10) state.pipes.shift();
+
+      // Scoring & collisions
+      const grace = state.t < state.startGraceMs;
+      for(const p of state.pipes){
+        if(!p.passed && p.x + PIPE_W < bird.x - bird.s){
+          p.passed = true; state.score++; document.getElementById('score').textContent = state.score;
+          if(state.score > state.best){ state.best = state.score; localStorage.setItem('flappy_best', state.best); document.getElementById('best').textContent = state.best; }
+          beep(880,0.06,'triangle',0.05);
+        }
+        if(!grace){
+          const r = bird.s*0.62;
+          if(intersectsPipe(bird.x, bird.y, r, p.x, 0, PIPE_W, p.gapY) ||
+             intersectsPipe(bird.x, bird.y, r, p.x, p.gapY + p.gap, PIPE_W, H - (p.gapY + p.gap))){
+            return gameOver();
+          }
+        }
+      }
+
+      // ★ ビームの更新＆衝突
+      const hitByBeam = updateBeams(dt, grace);
+      if(hitByBeam) return gameOver();
+
+      if(!grace && (bird.y > H-40 || bird.y < 0)) return gameOver();
+
+      // Particles
+      for(let i=state.particles.length-1;i>=0;i--){
+        const m = state.particles[i];
+        m.x += m.vx * dt; m.y += m.vy * dt; m.life -= dt*16.666; m.r *= 0.992;
+        if(m.life<=0 || m.r<0.5) state.particles.splice(i,1);
+      }
+    }
+
+    function gameOver(){
+      if(state.mode===MODE.OVER) return;
+      state.mode = MODE.OVER;
+      beep(180,0.18,'sawtooth',0.07); setTimeout(()=>beep(140,0.24,'sawtooth',0.06),70);
+      setTimeout(()=>{
+        const menu = document.getElementById('menu');
+        menu.style.display='grid';
+        document.getElementById('menuTitle').textContent = 'Game Over';
+        document.getElementById('menuSub').innerHTML = `Score: <b>${state.score}</b> ・ Best: <b>${state.best}</b>`;
+        const btn = document.getElementById('startBtn');
+        btn.textContent = '↻ もう一度';
+      }, 250);
+    }
+
+    function drawBg(){
+      ctx.fillStyle = '#0b0f1a';
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = 'rgba(255,255,255,.08)';
+      for(let i=0;i<40;i++) ctx.fillRect((i*37 + (state.t*0.02)%37)%W, (i*59)%H, 2,2);
+      const gH = 40;
+      ctx.fillStyle = '#0e1524';
+      ctx.fillRect(0, H-gH, W, gH);
+      ctx.fillStyle = 'rgba(255,255,255,.04)';
+      for(let x=0;x<W;x+=16){ ctx.fillRect(x, H-gH, 8, 2); }
+    }
+
+    function draw(){
+      drawBg();
+
+      // Pipes
+      for(const p of state.pipes){
+        const grad = ctx.createLinearGradient(p.x,0,p.x+PIPE_W,0);
+        grad.addColorStop(0,'#1e293b'); grad.addColorStop(1,'#0f172a');
+        ctx.fillStyle = grad;
+        ctx.fillRect(p.x, 0, PIPE_W, p.gapY);
+        ctx.fillRect(p.x, p.gapY + p.gap, PIPE_W, H - (p.gapY + p.gap));
+        ctx.fillStyle = 'rgba(255,255,255,.06)';
+        ctx.fillRect(p.x, p.gapY-10, PIPE_W, 10);
+        ctx.fillRect(p.x, p.gapY + p.gap, PIPE_W, 10);
+      }
+
+      // Particles
+      for(const m of state.particles){
+        ctx.fillStyle = 'rgba(110,231,255,.85)';
+        ctx.beginPath(); ctx.arc(m.x, m.y, m.r, 0, Math.PI*2); ctx.fill();
+      }
+
+      // Beams
+      for(const b of state.beams){
+        if(b.phase==='warn'){
+          // 警告ライン（右端に点滅）
+          const alpha = (Math.sin(state.t/80)+1)/2*0.6 + 0.25;
+          ctx.fillStyle = `rgba(255,80,80,${alpha.toFixed(3)})`;
+          ctx.fillRect(W-14, b.y-10, 12, 20);
+        }else{ // fire
+          const gradB = ctx.createLinearGradient(b.x-b.w, b.y, b.x, b.y);
+          gradB.addColorStop(0,'rgba(255,80,80,0.0)');
+          gradB.addColorStop(0.2,'rgba(255,80,80,0.35)');
+          gradB.addColorStop(0.6,'rgba(255,120,120,0.85)');
+          gradB.addColorStop(1,'rgba(255,230,230,1)');
+          ctx.fillStyle = gradB;
+          ctx.fillRect(b.x - b.w, b.y - b.h/2, b.w, b.h);
+          // 先端グロー
+          ctx.fillStyle = 'rgba(255,255,255,0.6)';
+          ctx.fillRect(b.x-2, b.y - b.h, 3, b.h*2);
+        }
+      }
+
+      // Bird
+      const b = state.bird;
+      ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(b.rot);
+      ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(-b.s/2+3, -b.s/2+3, b.s, b.s);
+      const grad = ctx.createLinearGradient(-b.s/2, -b.s/2, b.s/2, b.s/2);
+      grad.addColorStop(0, '#6ee7ff'); grad.addColorStop(1, '#60a5fa');
+      ctx.fillStyle = grad; ctx.fillRect(-b.s/2, -b.s/2, b.s, b.s);
+      ctx.fillStyle = '#fff'; ctx.fillRect(2, -6, 6, 6);
+      ctx.fillStyle = '#111'; ctx.fillRect(4, -4, 3, 3);
+      ctx.fillStyle = '#ffb86b'; ctx.fillRect(b.s/2-4, -2, 8, 4);
+      ctx.restore();
+
+      // UI
+      document.getElementById('best').textContent = state.best;
+
+      if(state.mode===MODE.PAUSE){
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0,0,W,H);
+        ctx.fillStyle = '#fff'; ctx.font = '700 26px system-ui'; ctx.textAlign='center';
+        ctx.fillText('PAUSED', W/2, H/2);
+      }
+    }
+
+    // Initialize
+    reset();
+  })();
+  </script>
+</body>
+</html>
